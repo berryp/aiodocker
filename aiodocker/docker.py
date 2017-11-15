@@ -20,11 +20,13 @@ from .logs import DockerLog
 from .swarm import DockerSwarm
 from .services import DockerServices
 from .tasks import DockerTasks
+from .requests_aws4auth import AWS4Auth
 from .volumes import DockerVolumes, DockerVolume
 
 __all__ = (
     'Docker',
-    'DockerContainers', 'DockerContainer',
+    'DockerContainers',
+    'DockerContainer',
     'DockerEvents',
     'DockerError',
     'DockerImages',
@@ -32,7 +34,8 @@ __all__ = (
     'DockerSwarm',
     'DockerServices',
     'DockerTasks',
-    'DockerVolumes', 'DockerVolume',
+    'DockerVolumes',
+    'DockerVolume',
 )
 
 log = logging.getLogger(__name__)
@@ -46,13 +49,29 @@ _rx_version = re.compile(r'^v\d+\.\d+$')
 _rx_tcp_schemes = re.compile(r'^(tcp|http)://')
 
 
+class MockRequest:
+    """
+    The standard library used to handle AWS4 authentication is designed
+    specifically for the python-requests library. As such, it exposes
+    an interface that expects a requests.Request object. The Request
+    initializer expects thins we don't have so we create a mock Request
+    object to pass to the aws4auth library.
+    """
+
+    def __init__(self, url, method, headers=None):
+        self.url = url
+        self.method = method
+        self.headers = headers or {}
+
+
 class Docker:
     def __init__(self,
                  url=None,
                  connector=None,
                  session=None,
                  ssl_context=None,
-                 api_version='v1.26'):
+                 api_version='v1.26',
+                 credentials=None):
 
         docker_host = url  # rename
         if docker_host is None:
@@ -67,6 +86,8 @@ class Docker:
         assert _rx_version.search(api_version) is not None, \
             'Invalid API version format'
         self.api_version = api_version
+
+        self.credentials = credentials
 
         if connector is None:
             if _rx_tcp_schemes.search(docker_host):
@@ -106,7 +127,8 @@ class Docker:
 
     async def auth(self, **credentials):
         response = await self._query_json(
-            "auth", "POST",
+            "auth",
+            "GET",
             data=credentials,
         )
         return response
@@ -116,22 +138,46 @@ class Docker:
         return data
 
     def _canonicalize_url(self, path):
-        return URL("{self.docker_host}/{self.api_version}/{path}"
-                   .format(self=self, path=path))
+        return URL("{self.docker_host}/{self.api_version}/{path}".format(
+            self=self, path=path))
 
-    async def _query(self, path, method='GET', *,
-                     params=None, data=None, headers=None,
+    def _auth_headers(self, url, method):
+        '''
+        Get AWS4 authentication headers
+        '''
+        url = url.human_repr().replace('tcp', 'https')
+        req = MockRequest(url, method)
+        auth = AWS4Auth(self.credentials['accesskey'],
+                        self.credentials['secretkey'],
+                        self.credentials['region'], 'hyper')
+
+        return auth(req).headers
+
+    async def _query(self,
+                     path,
+                     method='GET',
+                     *,
+                     params=None,
+                     data=None,
+                     headers=None,
                      timeout=None):
         '''
         Get the response object by performing the HTTP request.
         The caller is responsible to finalize the response object.
         '''
         url = self._canonicalize_url(path)
-        if headers and 'content-type' not in headers:
-            headers['content-type'] = 'application/json'
+        headers = headers or {}
+        if headers and 'Content-Type' not in headers:
+            headers['Content-Type'] = 'application/json'
+
+        # Attach the Hyper auth headers.
+        auth_headers = self._auth_headers(url, method)
+        headers.update(auth_headers)
+
         try:
             response = await self.session.request(
-                method, url,
+                method,
+                url,
                 params=httpize(params),
                 headers=headers,
                 data=data,
@@ -140,30 +186,39 @@ class Docker:
             raise
         if (response.status // 100) in [4, 5]:
             what = await response.read()
-            content_type = response.headers.get('content-type', '')
+            content_type = response.headers.get('Content-Type', '')
             response.close()
             if content_type == 'application/json':
                 raise DockerError(response.status,
                                   json.loads(what.decode('utf8')))
             else:
-                raise DockerError(response.status,
-                                  {"message": what.decode('utf8')})
+                raise DockerError(response.status, {
+                    "message": what.decode('utf8')
+                })
         return response
 
-    async def _query_json(self, path, method='GET', *,
-                          params=None, data=None, headers=None,
+    async def _query_json(self,
+                          path,
+                          method='GET',
+                          *,
+                          params=None,
+                          data=None,
+                          headers=None,
                           timeout=None):
         '''
         A shorthand of _query() that treats the input as JSON.
         '''
         if headers is None:
             headers = {}
-        headers['content-type'] = 'application/json'
+        headers['Content-Type'] = 'application/json'
         if not isinstance(data, (str, bytes)):
             data = json.dumps(data)
         response = await self._query(
-            path, method,
-            params=params, data=data, headers=headers,
+            path,
+            method,
+            params=params,
+            data=data,
+            headers=headers,
             timeout=timeout)
         data = await parse_result(response, 'json')
         return data
@@ -200,6 +255,6 @@ class Docker:
                              "DOCKER_CERT_PATH is not set!")
         certs_path = Path(certs_path)
         context.load_verify_locations(cafile=certs_path / 'ca.pem')
-        context.load_cert_chain(certfile=certs_path / 'cert.pem',
-                                keyfile=certs_path / 'key.pem')
+        context.load_cert_chain(
+            certfile=certs_path / 'cert.pem', keyfile=certs_path / 'key.pem')
         return context
